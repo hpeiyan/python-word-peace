@@ -1,3 +1,4 @@
 aiohttp
 requests
 gunicorn
+uvloop; sys_platform != 'win32'
