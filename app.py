@@ -13,6 +13,12 @@ import ipaddress
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
 # 环境变量
 UUID = os.environ.get('UUID', 'b8596c11-691a-4f72-b05d-d867e60af1c6')   # 节点UUID
 WSPATH = os.environ.get('WSPATH', 'b8596c11')          # 节点路径
@@ -23,6 +29,15 @@ BLOCKED_DOMAINS = [
     'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
     'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
 ]
+
+BLOCKED_PORTS = {22, 25, 135, 137, 138, 139, 445, 3389} # 常见高危端口
+
+def is_private_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
+    except ValueError:
+        return False
 
 # 全局 DNS 缓存 与 全局复用 Session、限流器 (防止 Serverless OOM 及 FD 耗尽)
 DNS_CACHE = {}
@@ -105,12 +120,13 @@ async def resolve_host(host: str) -> str:
     
     # DNS LRU 缓存检查
     now = time.time()
+    stale_ip = None
     if host in DNS_CACHE:
         ip, exp = DNS_CACHE[host]
         if now < exp:
             return ip
         else:
-            del DNS_CACHE[host]
+            stale_ip = ip # 保存过期 IP 作为 fallback
     
     # 内存保护机制：如果堆积的老化记录超过限制，强制清空 30% 最旧条目或直接清空
     if len(DNS_CACHE) > MAX_DNS_CACHE_SIZE:
@@ -160,6 +176,11 @@ async def resolve_host(host: str) -> str:
     except:
         pass
         
+    if stale_ip:
+        # 解析失败但有过期缓存，返回过期缓存 (Stale Cache)
+        DNS_CACHE[host] = (stale_ip, now + 60) # 延长 60 秒
+        return stale_ip
+        
     return host
 
 class ProxyHandler:
@@ -197,8 +218,10 @@ class ProxyHandler:
                 writer.write(early_data)
                 await writer.drain()
 
-            task1 = asyncio.create_task(self.forward_ws_to_tcp(websocket, writer))
-            task2 = asyncio.create_task(self.forward_tcp_to_ws(reader, websocket))
+            state = {'last_active': time.time()}
+            task1 = asyncio.create_task(self.forward_ws_to_tcp(websocket, writer, state))
+            task2 = asyncio.create_task(self.forward_tcp_to_ws(reader, websocket, state))
+            watchdog_task = asyncio.create_task(self.connection_watchdog(state, websocket, writer))
             
             # 解决死等隐患：一方结束或断开后，另一方最多允许收尾 5 秒，否则强行被主控协程回收
             done, pending = await asyncio.wait(
@@ -206,16 +229,21 @@ class ProxyHandler:
                 return_when=asyncio.FIRST_COMPLETED
             )
             
+            watchdog_task.cancel()
+            
             # 宽恕期等待优雅半关闭
             if pending:
                 for task in pending:
                     try:
                         await asyncio.wait_for(task, timeout=5.0)
                     except asyncio.TimeoutError:
-                        task.cancel()
+                        pass # wait_for 内部已自动 cancel
                     except Exception as e:
                         if DEBUG and not isinstance(e, (ConnectionResetError, BrokenPipeError, asyncio.CancelledError)):
                             logger.error(f"Error during half-close gracefully wait: {e}")
+                
+                # 确保被 cancel 的协程被彻底回收，防止泄漏
+                await asyncio.gather(*pending, return_exceptions=True)
                 
         except asyncio.TimeoutError:
             if DEBUG:
@@ -238,12 +266,36 @@ class ProxyHandler:
             if 'task2' in locals() and not task2.done():
                 task2.cancel()
 
-    async def forward_ws_to_tcp(self, websocket, writer):
+    async def connection_watchdog(self, state, websocket, writer):
         try:
-            async for msg in websocket:
+            while True:
+                await asyncio.sleep(10)
+                if time.time() - state['last_active'] > 300.0:
+                    if DEBUG:
+                        logger.debug("Connection Idle Timeout (Watchdog)")
+                    try:
+                        if not websocket.closed:
+                            await websocket.close()
+                    except:
+                        pass
+                    try:
+                        writer.close()
+                    except:
+                        pass
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def forward_ws_to_tcp(self, websocket, writer, state):
+        try:
+            while True:
+                msg = await websocket.receive()
+                state['last_active'] = time.time()
                 if msg.type == aiohttp.WSMsgType.BINARY:
                     writer.write(msg.data)
                     await writer.drain()
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -257,18 +309,19 @@ class ProxyHandler:
             except Exception:
                 pass
                 
-    async def forward_tcp_to_ws(self, reader, websocket):
+    async def forward_tcp_to_ws(self, reader, websocket, state):
         try:
             while True:
                 # 将 4KB 缓冲扩容到了 64KB，极大改善看视频和下载大文件吞吐量并显著降低 CPU 使用度
                 data = await reader.read(65536)
+                state['last_active'] = time.time()
                 if not data:
                     break
                 await websocket.send_bytes(data)
                 
                 # --- [ 大文件满速下载级 OOM 防御：手动注入下行读写背压 (Manual Backpressure) ] ---
                 # Aiohttp WebSocket 对象在极其暴力的下载吞吐且外网发包缓慢时，底层 _writer 会累积惊人内存数据。
-                # 设置极客级的高通透防爆闸：挂起发送队列如果大于 2MB (2 * 1024 * 1024 = 2097152 bytes)
+                # 设置极客级的高通透防爆闸：挂起发送队列如果大于 512KB (524288 bytes)
                 # 即代表底层外网物理带宽完全吃满发不出去，强制休眠当前协程 10 毫秒，阻断 TCP 疯狂抢读，倒逼源头降速。
                 try:
                     if websocket._writer and hasattr(websocket._writer, 'transport'):
@@ -276,7 +329,7 @@ class ProxyHandler:
                         if transport:
                             # 侦测底层物理 Socket 发送缓冲带的挂起尺寸
                             pending_size = transport.get_write_buffer_size()
-                            while pending_size > 2097152: # > 2MB  
+                            while pending_size > 524288: # > 512KB  
                                 await asyncio.sleep(0.01)
                                 if websocket.closed:
                                     break
@@ -339,12 +392,24 @@ class ProxyHandler:
             else:
                 return False
             
+            if port in BLOCKED_PORTS:
+                if DEBUG:
+                    logger.warning(f"Blocked high-risk port access: {port}")
+                await websocket.close()
+                return False
+
             if is_blocked_domain(host):
                 await websocket.close()
                 return False
             
             await websocket.send_bytes(bytes([0, 0]))
             resolved_host = await resolve_host(host)
+            
+            if is_private_ip(resolved_host):
+                if DEBUG:
+                    logger.warning(f"Blocked private IP access: {resolved_host}")
+                await websocket.close()
+                return False
             
             await self._forward_data(websocket, resolved_host, port, first_msg[i:])
             return True
@@ -465,3 +530,10 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer stopped by user")
+    finally:
+        # 确保直接运行时也能清理全局 Session
+        if GLOBAL_DOH_SESSION and not GLOBAL_DOH_SESSION.closed:
+            try:
+                asyncio.run(GLOBAL_DOH_SESSION.close())
+            except Exception:
+                pass
